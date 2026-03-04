@@ -1,0 +1,175 @@
+| ==========================================
+| DETECTION: Suspicious PowerShell Activity
+| Tactic: Execution (TA0002), Defense Evasion (TA0005)
+| Technique: T1059.001 - PowerShell
+| Data Sources: PowerShell Script Block Logs (Event 4104),
+|               Process Create (Sysmon EID 1),
+|               Windows PowerShell Logs
+| ==========================================
+
+
+| ==========================================
+| RULE 1: Encoded / Obfuscated PowerShell Command
+| Most common evasion technique
+| ==========================================
+
+index=windows_logs (sourcetype="WinEventLog:Security" OR sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational")
+(EventCode=4688 OR EventCode=1)
+(
+    CommandLine="* -EncodedCommand *"  OR
+    CommandLine="* -enc *"             OR
+    CommandLine="* -ec *"              OR
+    CommandLine="* -e *JAB*"           OR
+    CommandLine="* -e *TVq*"
+)
+Image IN ("*powershell.exe", "*pwsh.exe")
+| rex field=CommandLine "(?i)(?:-EncodedCommand|-enc|-ec|-e)\s+(?<encoded_payload>[A-Za-z0-9+/=]{20,})"
+| eval decoded_attempt = if(isnotnull(encoded_payload),
+    urldecode(replace(encoded_payload, " ", "+")), null())
+| eval detection_name = "PowerShell Encoded Command Execution"
+| eval severity = "HIGH"
+| eval mitre_technique = "T1059.001"
+| table _time, ComputerName, User, CommandLine, encoded_payload, ParentImage, severity, detection_name, mitre_technique
+| sort - _time
+
+
+| ==========================================
+| RULE 2: PowerShell Script Block Logging - Malicious Patterns
+| Event ID 4104 captures deobfuscated script content
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Microsoft-Windows-PowerShell/Operational" EventCode=4104
+(
+    ScriptBlockText="*IEX*"                          OR
+    ScriptBlockText="*Invoke-Expression*"             OR
+    ScriptBlockText="*Invoke-Mimikatz*"               OR
+    ScriptBlockText="*Invoke-Shellcode*"              OR
+    ScriptBlockText="*Invoke-ReflectivePEInjection*"  OR
+    ScriptBlockText="*PowerSploit*"                   OR
+    ScriptBlockText="*Empire*"                        OR
+    ScriptBlockText="*Net.WebClient*DownloadString*"  OR
+    ScriptBlockText="*Net.WebClient*DownloadFile*"    OR
+    ScriptBlockText="*WebRequest*"                    OR
+    ScriptBlockText="*bitsadmin*"                     OR
+    ScriptBlockText="*New-Object*Net.Sockets*"        OR
+    ScriptBlockText="*[Convert]::FromBase64String*"   OR
+    ScriptBlockText="*VirtualAlloc*"                  OR
+    ScriptBlockText="*CreateThread*"                  OR
+    ScriptBlockText="*WriteProcessMemory*"
+)
+| rex field=ScriptBlockText "(?<matched_pattern>IEX|Invoke-Expression|Invoke-Mimikatz|PowerSploit|Empire|DownloadString|DownloadFile|VirtualAlloc|CreateThread)"
+| eval detection_name = "Malicious PowerShell Script Block - " + matched_pattern
+| eval severity = case(
+    matched_pattern IN ("Invoke-Mimikatz", "VirtualAlloc", "CreateThread", "WriteProcessMemory"), "CRITICAL",
+    matched_pattern IN ("IEX", "Invoke-Expression", "Invoke-Shellcode"), "HIGH",
+    true(), "MEDIUM"
+)
+| eval mitre_technique = "T1059.001"
+| table _time, ComputerName, UserID, matched_pattern, ScriptBlockText, severity, detection_name, mitre_technique
+| sort - _time
+
+
+| ==========================================
+| RULE 3: PowerShell Download Cradle Detection
+| Fileless malware delivery via PowerShell
+| ==========================================
+
+index=windows_logs (EventCode=4104 OR EventCode=1)
+(
+    CommandLine="*DownloadString*"     OR
+    CommandLine="*DownloadFile*"       OR
+    CommandLine="*WebClient*"          OR
+    CommandLine="*Invoke-WebRequest*"  OR
+    CommandLine="*iwr*http*"           OR
+    CommandLine="*curl*http*"          OR
+    CommandLine="*wget*http*"          OR
+    ScriptBlockText="*DownloadString*" OR
+    ScriptBlockText="*Net.WebClient*"
+)
+| rex field=CommandLine "(?<download_url>https?://[^\s'\"]+)"
+| eval detection_name = "PowerShell Download Cradle"
+| eval severity = "HIGH"
+| eval mitre_technique = "T1059.001"
+| table _time, ComputerName, User, CommandLine, download_url, ParentImage, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 4: PowerShell Bypass Execution Policy
+| Attempts to bypass security controls
+| ==========================================
+
+index=windows_logs (EventCode=4688 OR EventCode=1)
+Image IN ("*powershell.exe", "*pwsh.exe")
+(
+    CommandLine="*-ExecutionPolicy Bypass*"      OR
+    CommandLine="*-ExecutionPolicy Unrestricted*" OR
+    CommandLine="*-ep bypass*"                   OR
+    CommandLine="*-ep unrestricted*"             OR
+    CommandLine="*Set-ExecutionPolicy Bypass*"   OR
+    CommandLine="*-nop*-sta*-w*1*"               OR
+    CommandLine="*-NonInteractive*-NoProfile*"   OR
+    CommandLine="*-windowstyle hidden*"
+)
+| eval flag_count = mvcount(split(CommandLine, " -"))
+| eval suspicious_flags = case(
+    match(CommandLine, "(?i)-windowstyle hidden") AND match(CommandLine, "(?i)-noprofile"), "HIDDEN+NOPROFILE",
+    match(CommandLine, "(?i)-executionpolicy bypass"), "EP_BYPASS",
+    true(), "SUSPICIOUS_FLAGS"
+)
+| eval detection_name = "PowerShell Security Bypass Flags - " + suspicious_flags
+| eval severity = "MEDIUM"
+| eval mitre_technique = "T1059.001"
+| table _time, ComputerName, User, CommandLine, suspicious_flags, ParentImage, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 5: PowerShell Spawned from Suspicious Parent
+| LOLBin / living-off-the-land technique
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+Image IN ("*powershell.exe", "*pwsh.exe")
+ParentImage IN (
+    "*winword.exe",
+    "*excel.exe",
+    "*outlook.exe",
+    "*mshta.exe",
+    "*wscript.exe",
+    "*cscript.exe",
+    "*regsvr32.exe",
+    "*rundll32.exe",
+    "*svchost.exe",
+    "*wmiprvse.exe",
+    "*taskeng.exe",
+    "*cmd.exe"
+)
+| eval parent_process = replace(ParentImage, ".*(\\\\|/)", "")
+| eval detection_name = "PowerShell Spawned from Suspicious Parent: " + parent_process
+| eval severity = case(
+    ParentImage IN ("*winword.exe", "*excel.exe", "*outlook.exe"), "CRITICAL",
+    ParentImage IN ("*mshta.exe", "*wscript.exe", "*cscript.exe"), "HIGH",
+    true(), "MEDIUM"
+)
+| eval mitre_technique = "T1059.001"
+| table _time, ComputerName, User, Image, CommandLine, ParentImage, ParentCommandLine, severity, detection_name, mitre_technique
+| sort - _time
+
+
+| ==========================================
+| RULE 6: PowerShell AMSI Bypass Attempts
+| Bypassing Antimalware Scan Interface
+| ==========================================
+
+index=windows_logs (EventCode=4104 OR EventCode=1)
+(
+    ScriptBlockText="*amsi*"              OR
+    CommandLine="*AmsiUtils*"             OR
+    ScriptBlockText="*[Ref].Assembly*"    OR
+    ScriptBlockText="*amsiInitFailed*"    OR
+    ScriptBlockText="*AmsiScanBuffer*"    OR
+    ScriptBlockText="*AmsiOpenSession*"
+)
+| eval detection_name = "PowerShell AMSI Bypass Attempt"
+| eval severity = "HIGH"
+| eval mitre_technique = "T1562.001"
+| table _time, ComputerName, User, ScriptBlockText, CommandLine, severity, detection_name, mitre_technique

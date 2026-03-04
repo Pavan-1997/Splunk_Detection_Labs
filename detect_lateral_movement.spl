@@ -1,0 +1,171 @@
+| ==========================================
+| DETECTION: Lateral Movement
+| Tactic: Lateral Movement (TA0008)
+| Techniques: T1021 (Remote Services), T1570 (Lateral Tool Transfer),
+|             T1550 (Use Alternate Auth Material)
+| Data Sources: Windows Security, Sysmon, Network Logs
+| ==========================================
+
+
+| ==========================================
+| RULE 1: PsExec / Remote Service Execution
+| Classic lateral movement tool
+| ==========================================
+
+index=windows_logs (
+    sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" OR
+    sourcetype="WinEventLog:Security"
+)
+(
+    EventCode=1 (
+        Image="*\\psexec*"          OR
+        Image="*\\psexesvc*"        OR
+        CommandLine="*psexec*"
+    )
+    OR
+    EventCode=7045 ServiceName="PSEXESVC"
+    OR
+    EventCode=4697 ServiceName="PSEXESVC"
+)
+| eval detection_name = "PsExec Lateral Movement Detected"
+| eval severity = "HIGH"
+| eval mitre_technique = "T1569.002"
+| table _time, ComputerName, User, Image, CommandLine, ServiceName, severity, detection_name, mitre_technique
+| sort - _time
+
+
+| ==========================================
+| RULE 2: WMI Remote Execution
+| WMIC used for remote command execution
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+(
+    (Image="*wmic.exe*" AND CommandLine="*/node:*")   OR
+    (Image="*wmic.exe*" AND CommandLine="*process call create*") OR
+    (ParentImage="*WmiPrvSE.exe*" AND Image IN (
+        "*cmd.exe*", "*powershell.exe*", "*wscript.exe*",
+        "*cscript.exe*", "*mshta.exe*", "*rundll32.exe*"
+    ))
+)
+| eval detection_name = case(
+    match(CommandLine, "(?i)/node:"), "WMI Remote Execution - Node Specified",
+    ParentImage="*WmiPrvSE.exe*", "Child Process Spawned via WMI",
+    true(), "Suspicious WMI Activity"
+)
+| eval severity = "HIGH"
+| eval mitre_technique = "T1021.006"
+| table _time, ComputerName, User, Image, CommandLine, ParentImage, ParentCommandLine, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 3: Pass-the-Hash / Pass-the-Ticket
+| Detecting alternate credential material abuse
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Security" EventCode=4624
+LogonType=3
+NOT AccountName="*$"
+NOT AccountName="-"
+AuthenticationPackageName="NTLM"
+| stats
+    count AS auth_count,
+    dc(WorkstationName) AS src_hosts,
+    dc(IpAddress) AS src_ips,
+    values(WorkstationName) AS source_workstations
+    BY AccountName, AccountDomain, IpAddress
+| where auth_count >= 3 AND src_hosts >= 2
+| eval detection_name = "Possible Pass-the-Hash - Lateral NTLM Auth"
+| eval severity = case(src_hosts >= 5, "HIGH", src_hosts >= 3, "MEDIUM", true(), "LOW")
+| eval mitre_technique = "T1550.002"
+| table _time, AccountName, AccountDomain, IpAddress, auth_count, src_hosts, source_workstations, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 4: Remote Desktop Protocol (RDP) Lateral Movement
+| Unusual RDP connections between internal hosts
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Security"
+(EventCode=4624 OR EventCode=4625)
+LogonType=10
+NOT (src_ip="10.0.0.*" AND dest_ip="10.0.0.*")
+| bucket _time span=1h
+| stats
+    count AS rdp_count,
+    dc(ComputerName) AS target_hosts,
+    values(ComputerName) AS targeted_systems,
+    dc(AccountName) AS unique_users
+    BY _time, IpAddress
+| where rdp_count >= 3 OR target_hosts >= 2
+| eval detection_name = "RDP Lateral Movement Pattern"
+| eval severity = case(target_hosts >= 5, "CRITICAL", target_hosts >= 3, "HIGH", true(), "MEDIUM")
+| eval mitre_technique = "T1021.001"
+| table _time, IpAddress, rdp_count, target_hosts, targeted_systems, unique_users, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 5: Admin Share Enumeration & Access
+| Accessing C$, ADMIN$, IPC$ from unusual sources
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Security" EventCode=5140
+ShareName IN ("\\\\*\\C$", "\\\\*\\ADMIN$", "\\\\*\\IPC$")
+NOT SubjectUserName="*$"
+| stats
+    count AS access_count,
+    dc(ShareName) AS shares_accessed,
+    values(ShareName) AS share_list,
+    dc(IpAddress) AS unique_ips
+    BY SubjectUserName, SubjectDomainName, IpAddress
+| where access_count >= 2
+| eval detection_name = "Admin Share Access - Possible Lateral Movement"
+| eval severity = case(shares_accessed >= 3, "HIGH", shares_accessed >= 2, "MEDIUM", true(), "LOW")
+| eval mitre_technique = "T1021.002"
+| table _time, SubjectUserName, SubjectDomainName, IpAddress, access_count, share_list, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 6: SMB Lateral Movement via Network Logon
+| Rapid authentication across multiple hosts
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Security" EventCode=4624
+LogonType=3
+NOT AccountName="*$"
+| bucket _time span=10m
+| stats
+    count AS logon_count,
+    dc(ComputerName) AS dest_hosts,
+    values(ComputerName) AS host_list,
+    dc(IpAddress) AS src_ips
+    BY _time, AccountName, AccountDomain
+| where dest_hosts >= 3 AND logon_count >= 5
+| eval detection_name = "SMB Lateral Movement - Rapid Multi-Host Authentication"
+| eval severity = case(dest_hosts >= 10, "CRITICAL", dest_hosts >= 5, "HIGH", true(), "MEDIUM")
+| eval mitre_technique = "T1021.002"
+| table _time, AccountName, AccountDomain, logon_count, dest_hosts, host_list, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 7: Remote Scheduled Task Creation
+| Attacker persistence via remote task scheduling
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Security"
+(EventCode=4698 OR EventCode=4702)
+NOT SubjectUserName="*$"
+| rex field=TaskContent "(?<task_command><Command>(?!.*schtasks).*?</Command>)"
+| eval detection_name = case(
+    match(task_command, "(?i)powershell|cmd|wscript|cscript|mshta|rundll32"),
+    "Remote Scheduled Task with Suspicious Command",
+    true(),
+    "Remote Scheduled Task Created"
+)
+| eval severity = case(
+    match(task_command, "(?i)powershell|cmd"), "HIGH",
+    isnotnull(task_command), "MEDIUM",
+    true(), "LOW"
+)
+| eval mitre_technique = "T1053.005"
+| table _time, ComputerName, SubjectUserName, TaskName, task_command, severity, detection_name, mitre_technique

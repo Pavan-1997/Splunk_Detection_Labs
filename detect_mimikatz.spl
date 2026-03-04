@@ -1,0 +1,134 @@
+| ==========================================
+| DETECTION: Mimikatz & Credential Dumping
+| Tactic: Credential Access (TA0006)
+| Technique: T1003 - OS Credential Dumping
+| Sub-Techniques: T1003.001 (LSASS), T1003.002 (SAM)
+| Data Sources: Sysmon, Windows Security, PowerShell Logs
+| ==========================================
+
+
+| ==========================================
+| RULE 1: LSASS Memory Access (Sysmon Event ID 10)
+| Most reliable Mimikatz indicator
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=10
+TargetImage="*lsass.exe"
+NOT (
+    SourceImage="*MsMpEng.exe" OR
+    SourceImage="*csrss.exe"   OR
+    SourceImage="*wininit.exe" OR
+    SourceImage="*services.exe" OR
+    SourceImage="*svchost.exe" OR
+    SourceImage="*lsass.exe"
+)
+| eval suspicious_access = case(
+    match(GrantedAccess, "0x1010|0x1410|0x1438|0x143a|0x1F3FFF"), "KNOWN_CREDENTIAL_DUMP_ACCESS",
+    match(GrantedAccess, "0x1fffff"), "ALL_ACCESS_SUSPICIOUS",
+    true(), "OTHER_LSASS_ACCESS"
+)
+| table _time, ComputerName, SourceImage, TargetImage, GrantedAccess, suspicious_access, CallTrace
+| eval severity = "HIGH"
+| eval detection_name = "LSASS Memory Access - Possible Mimikatz"
+| eval mitre_technique = "T1003.001"
+| sort - _time
+
+
+| ==========================================
+| RULE 2: Mimikatz Command Patterns in Process Creation
+| Sysmon Event ID 1 - Process Create
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+(
+    CommandLine="*sekurlsa*"           OR
+    CommandLine="*logonpasswords*"     OR
+    CommandLine="*lsadump*"            OR
+    CommandLine="*dcsync*"             OR
+    CommandLine="*privilege::debug*"   OR
+    CommandLine="*token::elevate*"     OR
+    CommandLine="*crypto::*"           OR
+    CommandLine="*kerberos::*"         OR
+    Image="*mimikatz*"                 OR
+    OriginalFileName="mimikatz.exe"
+)
+| eval detection_name = "Mimikatz Command Line Detected"
+| eval severity = "CRITICAL"
+| eval mitre_technique = "T1003"
+| table _time, ComputerName, User, Image, CommandLine, ParentImage, ParentCommandLine, severity, detection_name, mitre_technique
+| sort - _time
+
+
+| ==========================================
+| RULE 3: DCSync Attack Detection
+| Replication permissions abused to dump hashes
+| ==========================================
+
+index=windows_logs sourcetype="WinEventLog:Security" EventCode=4662
+ObjectType="*domainDNS*"
+(
+    Properties="*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*" OR
+    Properties="*1131f6ab-9c07-11d1-f79f-00c04fc2dcd2*" OR
+    Properties="*89e95b76-444d-4c62-991a-0facbeda640c*"
+)
+NOT SubjectUserName="*$"
+| eval detection_name = "DCSync Attack - Directory Replication Abuse"
+| eval severity = "CRITICAL"
+| eval mitre_technique = "T1003.006"
+| table _time, ComputerName, SubjectUserName, SubjectDomainName, ObjectName, Properties, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 4: SAM / NTDS Database Access
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=11
+(
+    TargetFilename="*\\Windows\\System32\\config\\SAM*" OR
+    TargetFilename="*\\Windows\\System32\\config\\SYSTEM*" OR
+    TargetFilename="*\\Windows\\NTDS\\ntds.dit*"
+)
+NOT Image IN ("*System32\\lsass.exe", "*System32\\svchost.exe")
+| eval detection_name = "Credential Database File Access"
+| eval severity = "CRITICAL"
+| eval mitre_technique = "T1003.002"
+| table _time, ComputerName, User, Image, TargetFilename, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 5: Windows Credential Editor / ProcDump on LSASS
+| Legitimate tools abused for credential dumping
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+(
+    (Image="*procdump*" AND CommandLine="*lsass*")           OR
+    (Image="*taskmgr.exe*" AND CommandLine="*lsass*")        OR
+    CommandLine="*comsvcs.dll*MiniDump*"                     OR
+    CommandLine="*comsvcs.dll*#24*"                          OR
+    Image="*wce.exe*"                                        OR
+    Image="*pwdump*"                                         OR
+    CommandLine="*Out-Minidump*"
+)
+| eval detection_name = "LSASS Dump via Legitimate Tool"
+| eval severity = "HIGH"
+| eval mitre_technique = "T1003.001"
+| table _time, ComputerName, User, Image, CommandLine, ParentImage, severity, detection_name, mitre_technique
+
+
+| ==========================================
+| RULE 6: Suspicious Named Pipe (Mimikatz Indicator)
+| Mimikatz uses specific named pipes
+| ==========================================
+
+index=windows_logs sourcetype="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=17
+(
+    PipeName="\\mimikatz*"  OR
+    PipeName="\\lsadump*"   OR
+    PipeName="\\sekurlsa*"  OR
+    PipeName="\\mimi*"
+)
+| eval detection_name = "Mimikatz Named Pipe Detected"
+| eval severity = "CRITICAL"
+| eval mitre_technique = "T1003"
+| table _time, ComputerName, User, Image, PipeName, severity, detection_name, mitre_technique
